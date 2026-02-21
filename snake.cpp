@@ -160,10 +160,17 @@ long long nowMicros() {
 
 // ─── Cleanup ────────────────────────────────────────────────
 void performCleanup() {
-    write(STDOUT_FILENO, RESET, strlen(RESET));
+    // Exit alternate screen buffer
+    write(STDOUT_FILENO, "\033[?1049l", 8);
+
+    // Reset colors + attributes
+    write(STDOUT_FILENO, "\033[0m", 4);
+
+    // Clear screen and move cursor home
+    write(STDOUT_FILENO, "\033[2J\033[H", 7);
+
     showCursor();
     disableRawMode();
-    clearScreen();
 }
 
 void atexitCleanup() {
@@ -802,6 +809,7 @@ int main() {
 
     enableRawMode();
     hideCursor();
+    write(STDOUT_FILENO, "\033[?1049h", 8); // enter alternate screen
     atexit(atexitCleanup);
 
     bool playing = true;
