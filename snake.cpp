@@ -1,7 +1,16 @@
+// ============================================================
+//  VSNAKE — Retro Terminal Snake Game (C++, No ncurses)
+//  Iteration 18: PC speaker ioctl sound + BEL fallback
+//  Compile: g++ -std=c++11 snake.cpp -o snake
+// ============================================================
+
 #include <time.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/kd.h>
 
 #include <iostream>
 #include <deque>
@@ -18,7 +27,7 @@
 #include <termios.h>
 #include <sys/select.h>
 
-// ─── ANSI Color Constants ───────────────────────────────────
+// ─── ANSI Constants ─────────────────────────────────────────
 #define RESET        "\033[0m"
 #define BOLD         "\033[1m"
 #define DIM          "\033[2m"
@@ -30,82 +39,90 @@
 #define BRIGHT_GREEN "\033[92m"
 #define BRIGHT_CYAN  "\033[96m"
 #define BRIGHT_WHITE "\033[97m"
+#define ERASE_LINE   "\033[K"
+#define ERASE_BELOW  "\033[J"
+
+// ─── Board ──────────────────────────────────────────────────
+static const int BOARD_WIDTH  = 40;
+static const int BOARD_HEIGHT = 20;
+static const int MIN_TERM_W   = BOARD_WIDTH * 2 + 10;
+static const int MIN_TERM_H   = BOARD_HEIGHT + 6;
 
 // ─── Game Constants ─────────────────────────────────────────
-static const char* APP_DIR_NAME    = "vsnake";
-static const char* SCORE_FILENAME  = "snake_scores.txt";
-static const int   TICK_US         = 120000;
-static const int   MIN_BOARD_W     = 10;
-static const int   MIN_BOARD_H     = 10;
-static const int   MIN_TERM_W      = 30;
-static const int   MIN_TERM_H      = 16;
-static const int   APPLE_MAX_TRIES = 1000;
+static const char* APP_DIR_NAME   = "vsnake";
+static const char* SCORE_FILENAME = "snake_scores.txt";
+static const int APPLE_MAX_TRIES  = 1000;
 
-// ─── Animation Constants (in frames at ~120ms/tick) ─────────
-static const int APPLE_BLINK_HALF  = 4;
-static const int HEAD_GLOW_PERIOD  = 3;
-static const int FLASH_DURATION    = 6;
+// ─── Timing ─────────────────────────────────────────────────
+static const int   RENDER_TICK_US    = 30000;
+static const int   BASE_MOVE_US      = 120000;
+static const int   MIN_MOVE_US       = 60000;
+static const int   SPEED_SCORE_STEP  = 50;
+static const int   SPEED_REDUCE_US   = 5000;
+static const float VERT_SPEED_FACTOR = 1.2f;
 
-// ─── Async-signal-safe interrupt flag ───────────────────────
+// ─── Animation ──────────────────────────────────────────────
+static const int APPLE_BLINK_HALF   = 16;
+static const int HEAD_GLOW_PERIOD   = 10;
+static const int APPLE_SPARKLE_RATE = 12;
+static const int FLASH_DURATION     = 24;
+
+// ─── Signal ─────────────────────────────────────────────────
 static volatile sig_atomic_t g_interrupted = 0;
+void signalHandler(int) { g_interrupted = 1; }
 
-void signalHandler(int) {
-    g_interrupted = 1;
-}
-
-// ─── Direction Enum ─────────────────────────────────────────
+// ─── Direction ──────────────────────────────────────────────
 enum Direction { UP, DOWN, LEFT, RIGHT };
 
-// ─── Point Struct ───────────────────────────────────────────
+static bool isOpposite(Direction a, Direction b) {
+    return (a == UP && b == DOWN) || (a == DOWN && b == UP) ||
+           (a == LEFT && b == RIGHT) || (a == RIGHT && b == LEFT);
+}
+static bool isVertical(Direction d) { return d == UP || d == DOWN; }
+
 struct Point {
     int x, y;
     bool operator==(const Point& o) const { return x == o.x && y == o.y; }
 };
 
-// ─── Score Entry ────────────────────────────────────────────
 struct ScoreEntry {
     std::string timestamp;
     int score;
+};
+
+// ─── App State Machine ─────────────────────────────────────
+enum AppState {
+    STATE_MENU, STATE_PLAYING, STATE_GAMEOVER,
+    STATE_RESIZED, STATE_TOO_SMALL, STATE_LEADERBOARD, STATE_EXIT
 };
 
 // ─── Game State ─────────────────────────────────────────────
 struct GameState {
     std::deque<Point> snake;
     Point             apple;
-    Direction         dir;
-    Direction         nextDir;
+    Direction         dir, nextDir;
     int               score;
-    int               boardWidth;
-    int               boardHeight;
-    int               termWidth;
-    int               termHeight;
-    bool              running;
-    bool              gameOver;
-    bool              gameWon;
-    bool              termResized;
-    bool              termTooSmall;
-    bool              paused;
-    bool              restartRequested;
-
-    bool              dirChangedThisTick;
-
-    // Animation state (render-only)
+    int               boardWidth, boardHeight;
+    int               termWidth, termHeight;
+    int               offsetX, offsetY;
+    bool              running, gameOver, gameWon;
+    bool              termResized, termTooSmall;
+    bool              paused, restartRequested;
+    bool              dirChangedThisTick, hasQueuedDir;
+    Direction         queuedDir;
+    long long         moveAccumulator;
     unsigned long     frameCount;
-    int               appleFlashTimer;
-    int               scoreFlashTimer;
-    int               prevScore;
-
-    // Persistent render buffers
+    int               appleFlashTimer, scoreFlashTimer, prevScore;
     std::vector<char> grid;
     std::string       renderBuf;
 
     void allocateBuffers() {
         grid.resize(boardWidth * boardHeight);
-        renderBuf.reserve((boardWidth * 2 + 80) * (boardHeight + 6));
+        renderBuf.reserve((boardWidth * 2 + 80) * (boardHeight + 8));
     }
 };
 
-// ─── Terminal helpers ───────────────────────────────────────
+// ─── Terminal ───────────────────────────────────────────────
 static struct termios origTermios;
 static bool rawModeEnabled = false;
 
@@ -121,61 +138,45 @@ void enableRawMode() {
     struct termios raw = origTermios;
     raw.c_lflag &= ~(ECHO | ICANON);
     raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
-    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
     rawModeEnabled = true;
 }
 
-void clearScreen() {
-    write(STDOUT_FILENO, "\033[2J\033[1;1H", 11);
-}
-
-void hideCursor() {
-    write(STDOUT_FILENO, "\033[?25l", 6);
-}
-
-void showCursor() {
-    write(STDOUT_FILENO, "\033[?25h", 6);
-}
+void clearScreen()  { write(STDOUT_FILENO, "\033[2J\033[1;1H", 11); }
+void hideCursor()   { write(STDOUT_FILENO, "\033[?25l", 6); }
+void showCursor()   { write(STDOUT_FILENO, "\033[?25h", 6); }
 
 void getTerminalSize(int &w, int &h) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 ||
-        ws.ws_col == 0 || ws.ws_row == 0) {
-        w = 80;
-        h = 24;
-    } else {
-        w = ws.ws_col;
-        h = ws.ws_row;
-    }
+        ws.ws_col == 0 || ws.ws_row == 0) { w = 80; h = 24; }
+    else { w = ws.ws_col; h = ws.ws_row; }
 }
 
-// ─── Monotonic clock ────────────────────────────────────────
 long long nowMicros() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
 }
 
-// ─── Cleanup ────────────────────────────────────────────────
 void performCleanup() {
-    // Exit alternate screen buffer
     write(STDOUT_FILENO, "\033[?1049l", 8);
-
-    // Reset colors + attributes
     write(STDOUT_FILENO, "\033[0m", 4);
-
-    // Clear screen and move cursor home
     write(STDOUT_FILENO, "\033[2J\033[H", 7);
-
     showCursor();
     disableRawMode();
 }
+void atexitCleanup() { performCleanup(); }
 
-void atexitCleanup() {
-    performCleanup();
-}
+// ===== SOUND DISABLED ======================================
+
+inline void soundEat() {}
+inline void soundGameOver() {}     //Zack here, fucked up the sound.
+inline void soundMenuMove() {}     //So now removing it with laziness     
+inline void soundMenuSelect() {}   // added dummy functions so code wont break
+inline void soundPauseToggle() {}  //sorry :(
 
 // ─── Timestamp ──────────────────────────────────────────────
 std::string getCurrentTimestamp() {
@@ -186,74 +187,40 @@ std::string getCurrentTimestamp() {
     return std::string(buf);
 }
 
-// ─── XDG-Compliant Score File Path ──────────────────────────
-//
-// Follows the XDG Base Directory Specification:
-//
-//   Priority 1: $XDG_DATA_HOME/vsnake/snake_scores.txt
-//   Priority 2: $HOME/.local/share/vsnake/snake_scores.txt
-//   Priority 3: ./snake_scores.txt  (last resort fallback)
-//
-// Creates intermediate directories if they don't exist.
-// Uses mkdir() with 0755 permissions (user rwx, group/other rx).
-// Silently ignores EEXIST (directory already exists).
-//
+// ─── XDG Score Path ─────────────────────────────────────────
 static bool ensureDirectoryExists(const std::string &path) {
     struct stat st;
-    if (stat(path.c_str(), &st) == 0) {
-        return S_ISDIR(st.st_mode);
-    }
+    if (stat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
     return mkdir(path.c_str(), 0755) == 0;
 }
 
-// Recursively create path components (like mkdir -p)
 static bool mkdirRecursive(const std::string &path) {
     if (path.empty()) return false;
-
-    // Walk the path string and create each component
     std::string built;
     for (size_t i = 0; i < path.size(); i++) {
         built += path[i];
         if (path[i] == '/' && built.size() > 1) {
             struct stat st;
-            if (stat(built.c_str(), &st) != 0) {
-                if (mkdir(built.c_str(), 0755) != 0 && errno != EEXIST) {
+            if (stat(built.c_str(), &st) != 0)
+                if (mkdir(built.c_str(), 0755) != 0 && errno != EEXIST)
                     return false;
-                }
-            }
         }
     }
-    // Create final component
     return ensureDirectoryExists(path);
 }
 
 static std::string getScoreFilePath() {
     std::string dataDir;
-
-    // Priority 1: $XDG_DATA_HOME
-    const char* xdgDataHome = getenv("XDG_DATA_HOME");
-    if (xdgDataHome && xdgDataHome[0] != '\0') {
-        dataDir = std::string(xdgDataHome) + "/" + APP_DIR_NAME;
-    }
-
-    // Priority 2: $HOME/.local/share
+    const char* xdg = getenv("XDG_DATA_HOME");
+    if (xdg && xdg[0] != '\0')
+        dataDir = std::string(xdg) + "/" + APP_DIR_NAME;
     if (dataDir.empty()) {
         const char* home = getenv("HOME");
-        if (home && home[0] != '\0') {
+        if (home && home[0] != '\0')
             dataDir = std::string(home) + "/.local/share/" + APP_DIR_NAME;
-        }
     }
-
-    // Attempt to create the directory and return the full path
-    if (!dataDir.empty()) {
-        if (mkdirRecursive(dataDir)) {
-            return dataDir + "/" + SCORE_FILENAME;
-        }
-        // If directory creation failed (permissions, etc.),
-        // fall through to fallback
-    }
-
-    // Priority 3: current directory (last resort)
+    if (!dataDir.empty() && mkdirRecursive(dataDir))
+        return dataDir + "/" + SCORE_FILENAME;
     return SCORE_FILENAME;
 }
 
@@ -261,9 +228,8 @@ static std::string getScoreFilePath() {
 void saveScore(int score) {
     std::string path = getScoreFilePath();
     std::ofstream file(path.c_str(), std::ios::app);
-    if (file.is_open()) {
+    if (file.is_open())
         file << getCurrentTimestamp() << " | " << score << "\n";
-    }
 }
 
 std::vector<ScoreEntry> loadScores() {
@@ -290,98 +256,84 @@ std::vector<ScoreEntry> loadScores() {
     return scores;
 }
 
-// ─── Safe Apple Spawning ────────────────────────────────────
+// ─── Movement ───────────────────────────────────────────────
+long long calcBaseInterval(int score) {
+    int steps = score / SPEED_SCORE_STEP;
+    long long iv = BASE_MOVE_US - (long long)steps * SPEED_REDUCE_US;
+    return iv < MIN_MOVE_US ? MIN_MOVE_US : iv;
+}
+
+long long calcMoveInterval(int score, Direction d) {
+    long long iv = calcBaseInterval(score);
+    if (isVertical(d)) iv = (long long)(iv * VERT_SPEED_FACTOR);
+    return iv;
+}
+
+// ─── Apple Spawning ─────────────────────────────────────────
 bool spawnApple(GameState &g) {
-    int totalCells = g.boardWidth * g.boardHeight;
+    int total = g.boardWidth * g.boardHeight;
+    if ((int)g.snake.size() >= total) return false;
 
-    if ((int)g.snake.size() >= totalCells) {
-        return false;
-    }
-
-    if ((int)g.snake.size() > totalCells * 3 / 4) {
-        std::vector<char> occupied(totalCells, 0);
-        for (const auto &s : g.snake) {
-            occupied[s.y * g.boardWidth + s.x] = 1;
-        }
-        std::vector<Point> freeCells;
-        freeCells.reserve(totalCells - (int)g.snake.size());
-        for (int y = 0; y < g.boardHeight; y++) {
-            for (int x = 0; x < g.boardWidth; x++) {
-                if (!occupied[y * g.boardWidth + x]) {
-                    freeCells.push_back({x, y});
-                }
-            }
-        }
-        if (freeCells.empty()) return false;
-        g.apple = freeCells[rand() % (int)freeCells.size()];
+    if ((int)g.snake.size() > total * 3 / 4) {
+        std::vector<char> occ(total, 0);
+        for (auto &s : g.snake) occ[s.y * g.boardWidth + s.x] = 1;
+        std::vector<Point> free;
+        for (int y = 0; y < g.boardHeight; y++)
+            for (int x = 0; x < g.boardWidth; x++)
+                if (!occ[y * g.boardWidth + x]) free.push_back({x, y});
+        if (free.empty()) return false;
+        g.apple = free[rand() % (int)free.size()];
         g.appleFlashTimer = FLASH_DURATION;
         return true;
     }
 
-    for (int attempt = 0; attempt < APPLE_MAX_TRIES; attempt++) {
-        Point p = { rand() % g.boardWidth, rand() % g.boardHeight };
-        bool onSnake = false;
-        for (const auto &s : g.snake) {
-            if (s == p) { onSnake = true; break; }
-        }
-        if (!onSnake) {
-            g.apple = p;
-            g.appleFlashTimer = FLASH_DURATION;
-            return true;
-        }
+    for (int a = 0; a < APPLE_MAX_TRIES; a++) {
+        Point p = {rand() % g.boardWidth, rand() % g.boardHeight};
+        bool on = false;
+        for (auto &s : g.snake) if (s == p) { on = true; break; }
+        if (!on) { g.apple = p; g.appleFlashTimer = FLASH_DURATION; return true; }
     }
 
-    for (int y = 0; y < g.boardHeight; y++) {
+    for (int y = 0; y < g.boardHeight; y++)
         for (int x = 0; x < g.boardWidth; x++) {
-            Point p = {x, y};
-            bool onSnake = false;
-            for (const auto &s : g.snake) {
-                if (s == p) { onSnake = true; break; }
-            }
-            if (!onSnake) {
-                g.apple = p;
-                g.appleFlashTimer = FLASH_DURATION;
-                return true;
-            }
+            Point p = {x, y}; bool on = false;
+            for (auto &s : g.snake) if (s == p) { on = true; break; }
+            if (!on) { g.apple = p; g.appleFlashTimer = FLASH_DURATION; return true; }
         }
-    }
-
     return false;
 }
 
-// ─── Initialization ────────────────────────────────────────
+// ─── Centering ──────────────────────────────────────────────
+static void calcCenteringOffsets(GameState &g) {
+    int vw = BOARD_WIDTH * 2 + 4;
+    int vh = BOARD_HEIGHT + 5;
+    g.offsetX = std::max(0, (g.termWidth - vw) / 2);
+    g.offsetY = std::max(0, (g.termHeight - vh) / 2);
+}
+
+// ─── Init ───────────────────────────────────────────────────
 void initGame(GameState &g) {
     getTerminalSize(g.termWidth, g.termHeight);
-
     g.termTooSmall = (g.termWidth < MIN_TERM_W || g.termHeight < MIN_TERM_H);
-
-    g.boardWidth  = (g.termWidth - 6) / 2;
-    g.boardHeight = g.termHeight - 6;
-    if (g.boardWidth  < MIN_BOARD_W) g.boardWidth  = MIN_BOARD_W;
-    if (g.boardHeight < MIN_BOARD_H) g.boardHeight = MIN_BOARD_H;
+    g.boardWidth = BOARD_WIDTH;
+    g.boardHeight = BOARD_HEIGHT;
+    calcCenteringOffsets(g);
 
     g.snake.clear();
-    int cx = g.boardWidth  / 2;
-    int cy = g.boardHeight / 2;
-    g.snake.push_back({cx,     cy});
+    int cx = g.boardWidth / 2, cy = g.boardHeight / 2;
+    g.snake.push_back({cx, cy});
     g.snake.push_back({cx - 1, cy});
     g.snake.push_back({cx - 2, cy});
 
-    g.dir                = RIGHT;
-    g.nextDir            = RIGHT;
-    g.score              = 0;
-    g.running            = true;
-    g.gameOver           = false;
-    g.gameWon            = false;
-    g.termResized        = false;
-    g.paused             = false;
-    g.restartRequested   = false;
+    g.dir = RIGHT; g.nextDir = RIGHT;
+    g.score = 0; g.running = true;
+    g.gameOver = false; g.gameWon = false;
+    g.termResized = false; g.paused = false;
+    g.restartRequested = false;
     g.dirChangedThisTick = false;
-
-    g.frameCount         = 0;
-    g.appleFlashTimer    = 0;
-    g.scoreFlashTimer    = 0;
-    g.prevScore          = 0;
+    g.hasQueuedDir = false; g.queuedDir = RIGHT;
+    g.moveAccumulator = 0; g.frameCount = 0;
+    g.appleFlashTimer = 0; g.scoreFlashTimer = 0; g.prevScore = 0;
 
     g.allocateBuffers();
     spawnApple(g);
@@ -389,143 +341,112 @@ void initGame(GameState &g) {
 
 // ─── Resize Check ───────────────────────────────────────────
 bool checkTerminalResize(GameState &g) {
-    int newW, newH;
-    getTerminalSize(newW, newH);
-    if (newW != g.termWidth || newH != g.termHeight) {
-        g.termResized = true;
-        g.running     = false;
-        return true;
+    int nw, nh; getTerminalSize(nw, nh);
+    if (nw != g.termWidth || nh != g.termHeight) {
+        g.termResized = true; g.running = false; return true;
     }
     return false;
 }
 
-// ─── Non-blocking Input ─────────────────────────────────────
+// ─── Direction Change ───────────────────────────────────────
+static void tryChangeDirection(GameState &g, Direction d) {
+    if (!g.dirChangedThisTick) {
+        if (!isOpposite(d, g.dir)) {
+            g.nextDir = d; g.dirChangedThisTick = true; g.hasQueuedDir = false;
+        }
+    } else {
+        if (!isOpposite(d, g.nextDir) && d != g.nextDir) {
+            g.queuedDir = d; g.hasQueuedDir = true;
+        }
+    }
+}
+
+// ─── Input ──────────────────────────────────────────────────
 void readInput(GameState &g) {
     char c = 0;
     while (true) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
+        fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
         struct timeval tv = {0, 0};
-        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0)
-            break;
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) break;
         if (read(STDIN_FILENO, &c, 1) != 1) break;
 
-        if (c == 'q' || c == 'Q') {
-            g.running = false;
-            return;
-        }
-
-        if (c == 'r' || c == 'R') {
-            g.restartRequested = true;
-            g.running = false;
-            return;
-        }
-
-        if (c == 'p' || c == 'P') {
-            g.paused = !g.paused;
-            continue;
-        }
-
+        if (c == 'q' || c == 'Q') { g.running = false; return; }
+        if (c == 'r' || c == 'R') { g.restartRequested = true; g.running = false; return; }
+        if (c == 'p' || c == 'P') { g.paused = !g.paused; soundPauseToggle(); continue; }
         if (g.paused) continue;
 
         if (c == '\033') {
             char seq[2] = {0, 0};
             fd_set f2; struct timeval t2;
-            FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2);
-            t2 = {0, 5000};
+            FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
             if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
                 read(STDIN_FILENO, &seq[0], 1);
-            FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2);
-            t2 = {0, 5000};
+            FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
             if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
                 read(STDIN_FILENO, &seq[1], 1);
-
-            if (seq[0] == '[' && !g.dirChangedThisTick) {
+            if (seq[0] == '[') {
                 switch (seq[1]) {
-                    case 'A': if (g.dir != DOWN)  { g.nextDir = UP;    g.dirChangedThisTick = true; } break;
-                    case 'B': if (g.dir != UP)    { g.nextDir = DOWN;  g.dirChangedThisTick = true; } break;
-                    case 'D': if (g.dir != RIGHT) { g.nextDir = LEFT;  g.dirChangedThisTick = true; } break;
-                    case 'C': if (g.dir != LEFT)  { g.nextDir = RIGHT; g.dirChangedThisTick = true; } break;
+                    case 'A': tryChangeDirection(g, UP);    break;
+                    case 'B': tryChangeDirection(g, DOWN);  break;
+                    case 'D': tryChangeDirection(g, LEFT);  break;
+                    case 'C': tryChangeDirection(g, RIGHT); break;
                 }
             }
             continue;
         }
-
-        if (g.dirChangedThisTick) continue;
-
         switch (c) {
-            case 'w': case 'W': case 'k': case 'K':
-                if (g.dir != DOWN)  { g.nextDir = UP;    g.dirChangedThisTick = true; } break;
-            case 's': case 'S': case 'j': case 'J':
-                if (g.dir != UP)    { g.nextDir = DOWN;  g.dirChangedThisTick = true; } break;
-            case 'a': case 'A': case 'h': case 'H':
-                if (g.dir != RIGHT) { g.nextDir = LEFT;  g.dirChangedThisTick = true; } break;
-            case 'd': case 'D': case 'l': case 'L':
-                if (g.dir != LEFT)  { g.nextDir = RIGHT; g.dirChangedThisTick = true; } break;
+            case 'w': case 'W': case 'k': case 'K': tryChangeDirection(g, UP);    break;
+            case 's': case 'S': case 'j': case 'J': tryChangeDirection(g, DOWN);  break;
+            case 'a': case 'A': case 'h': case 'H': tryChangeDirection(g, LEFT);  break;
+            case 'd': case 'D': case 'l': case 'L': tryChangeDirection(g, RIGHT); break;
         }
     }
 }
 
-// ─── Game Update (UNCHANGED) ────────────────────────────────
+// ─── Game Update ────────────────────────────────────────────
 void updateGame(GameState &g) {
     if (g.paused) return;
-
     g.dir = g.nextDir;
-
-    Point head = g.snake.front();
-    Point nh   = head;
+    Point head = g.snake.front(), nh = head;
     switch (g.dir) {
-        case UP:    nh.y--; break;
-        case DOWN:  nh.y++; break;
-        case LEFT:  nh.x--; break;
-        case RIGHT: nh.x++; break;
+        case UP: nh.y--; break; case DOWN: nh.y++; break;
+        case LEFT: nh.x--; break; case RIGHT: nh.x++; break;
     }
 
-    if (nh.x < 0 || nh.x >= g.boardWidth ||
-        nh.y < 0 || nh.y >= g.boardHeight) {
-        g.gameOver = true;
-        g.running  = false;
-        return;
+    if (nh.x < 0 || nh.x >= g.boardWidth || nh.y < 0 || nh.y >= g.boardHeight) {
+        g.gameOver = true; g.running = false; soundGameOver(); return;
     }
 
     bool growing = (nh == g.apple);
-
-    int checkLimit = (int)g.snake.size() - (growing ? 0 : 1);
-    for (int i = 0; i < checkLimit; i++) {
+    int limit = (int)g.snake.size() - (growing ? 0 : 1);
+    for (int i = 0; i < limit; i++) {
         if (g.snake[i] == nh) {
-            g.gameOver = true;
-            g.running  = false;
-            return;
+            g.gameOver = true; g.running = false; soundGameOver(); return;
         }
     }
 
     g.snake.push_front(nh);
-
     if (growing) {
         g.score += 10;
-        if (!spawnApple(g)) {
-            g.gameWon = true;
-            g.running = false;
-        }
+        soundEat();
+        if (!spawnApple(g)) { g.gameWon = true; g.running = false; }
     } else {
         g.snake.pop_back();
     }
 }
 
-// ─── ANIMATED RENDERING ─────────────────────────────────────
+// ─── Rendering ──────────────────────────────────────────────
 void render(GameState &g) {
-
     if (g.score != g.prevScore) {
         g.scoreFlashTimer = FLASH_DURATION;
         g.prevScore = g.score;
     }
 
     bool appleFlashing    = g.appleFlashTimer > 0;
-    bool scoreFlashing    = g.scoreFlashTimer > 0;
     bool appleVisible     = ((g.frameCount / APPLE_BLINK_HALF) % 2) == 0;
-    bool headGlowPhase    = ((g.frameCount / HEAD_GLOW_PERIOD) % 2) == 0;
     bool appleFlashBright = (g.appleFlashTimer > FLASH_DURATION / 2);
+    int headPhase         = (g.frameCount / HEAD_GLOW_PERIOD) % 3;
+    int sparklePhase      = (g.frameCount / APPLE_SPARKLE_RATE) % 3;
 
     if (!g.paused) {
         g.frameCount++;
@@ -534,11 +455,10 @@ void render(GameState &g) {
     }
 
     std::fill(g.grid.begin(), g.grid.end(), ' ');
-
     int bodyLen = (int)g.snake.size() - 1;
     for (size_t i = 1; i < g.snake.size(); i++) {
-        int segIdx = (int)i - 1;
-        int zone = (bodyLen <= 0) ? 0 : (segIdx * 4 / bodyLen);
+        int seg = (int)i - 1;
+        int zone = (bodyLen <= 0) ? 0 : (seg * 4 / bodyLen);
         if (zone > 3) zone = 3;
         g.grid[g.snake[i].y * g.boardWidth + g.snake[i].x] = (char)('a' + zone);
     }
@@ -547,50 +467,51 @@ void render(GameState &g) {
 
     std::string &buf = g.renderBuf;
     buf.clear();
-
     buf += "\033[1;1H";
+
+    int vbw = g.boardWidth * 2 + 4;
+    std::string hpad(g.offsetX, ' ');
 
     char scoreCStr[32];
     snprintf(scoreCStr, sizeof(scoreCStr), "Score: %d", g.score);
-    int scoreVisualLen = (int)strlen(scoreCStr);
+    int scoreVisLen = (int)strlen(scoreCStr);
 
-    int visualBoardWidth = g.boardWidth * 2 + 4;
+    for (int r = 0; r < g.offsetY; r++) buf += ERASE_LINE "\n";
 
-    // ═══ TOP BORDER ═════════════════════════════════════════
-    buf += "  ";
-    buf += CYAN;
-    for (int i = 0; i < visualBoardWidth; i++) buf += '#';
-    buf += RESET;
-    buf += "  ";
-
-    if (scoreFlashing) {
-        if (g.scoreFlashTimer > FLASH_DURATION / 2) {
-            buf += BOLD BRIGHT_WHITE;
+    {
+        int pad = std::max(0, (g.termWidth - scoreVisLen) / 2);
+        for (int i = 0; i < pad; i++) buf += ' ';
+        if (g.scoreFlashTimer > 0) {
+            float ratio = (float)g.scoreFlashTimer / FLASH_DURATION;
+            if (ratio > 0.75f)      buf += BOLD BRIGHT_WHITE;
+            else if (ratio > 0.5f)  buf += BOLD BRIGHT_GREEN;
+            else if (ratio > 0.25f) buf += BOLD GREEN;
+            else                    buf += YELLOW;
         } else {
-            buf += BOLD BRIGHT_GREEN;
+            buf += BOLD YELLOW;
         }
-    } else {
-        buf += BOLD YELLOW;
+        buf += scoreCStr;
+        buf += RESET;
     }
-    buf += scoreCStr;
-    buf += RESET;
+    buf += ERASE_LINE "\n";
 
-    int usedCols = 2 + visualBoardWidth + 2 + scoreVisualLen;
-    for (int i = usedCols; i < g.termWidth; i++) buf += ' ';
-    buf += '\n';
+    buf += hpad; buf += CYAN;
+    for (int i = 0; i < vbw; i++) buf += '#';
+    buf += RESET ERASE_LINE "\n";
 
-    // ═══ BOARD ROWS ═════════════════════════════════════════
     for (int y = 0; y < g.boardHeight; y++) {
-        buf += "  ";
+        buf += hpad;
         buf += CYAN "##" RESET;
-
         int base = y * g.boardWidth;
         for (int x = 0; x < g.boardWidth; x++) {
             char c = g.grid[base + x];
             switch (c) {
                 case 'H':
-                    if (headGlowPhase) buf += BOLD BRIGHT_GREEN "OO" RESET;
-                    else               buf += BOLD BRIGHT_CYAN  "OO" RESET;
+                    switch (headPhase) {
+                        case 0: buf += BOLD BRIGHT_GREEN "OO" RESET; break;
+                        case 1: buf += BOLD BRIGHT_CYAN  "OO" RESET; break;
+                        case 2: buf += BOLD BRIGHT_WHITE "OO" RESET; break;
+                    }
                     break;
                 case 'a': buf += BOLD BRIGHT_GREEN "oo" RESET; break;
                 case 'b': buf += BRIGHT_GREEN      "oo" RESET; break;
@@ -601,55 +522,45 @@ void render(GameState &g) {
                         if (appleFlashBright) buf += BOLD BRIGHT_WHITE "@@" RESET;
                         else                  buf += BOLD YELLOW       "@@" RESET;
                     } else if (appleVisible) {
-                        buf += BOLD RED "@@" RESET;
+                        switch (sparklePhase) {
+                            case 0: buf += BOLD RED          "@@" RESET; break;
+                            case 1: buf += BOLD YELLOW       "**" RESET; break;
+                            case 2: buf += BOLD BRIGHT_WHITE "##" RESET; break;
+                        }
                     } else {
-                        buf += DIM RED  "@@" RESET;
+                        buf += DIM RED "@@" RESET;
                     }
                     break;
-                default:
-                    buf += "  ";
-                    break;
+                default: buf += "  "; break;
             }
         }
-
-        buf += CYAN "##" RESET;
-
-        int rowVisualLen = 2 + visualBoardWidth;
-        for (int i = rowVisualLen; i < g.termWidth; i++) buf += ' ';
-        buf += '\n';
+        buf += CYAN "##" RESET ERASE_LINE "\n";
     }
 
-    // ═══ BOTTOM BORDER ══════════════════════════════════════
-    buf += "  ";
-    buf += CYAN;
-    for (int i = 0; i < visualBoardWidth; i++) buf += '#';
-    buf += RESET;
-    for (int i = 2 + visualBoardWidth; i < g.termWidth; i++) buf += ' ';
-    buf += '\n';
+    buf += hpad; buf += CYAN;
+    for (int i = 0; i < vbw; i++) buf += '#';
+    buf += RESET ERASE_LINE "\n";
 
-    // ═══ INSTRUCTIONS ═══════════════════════════════════════
-    const char* instrText =
-        "  Move: WASD/HJKL/Arrows | P: Pause | R: Restart | Q: Quit";
-    int instrVisualLen = (int)strlen(instrText);
-    buf += CYAN;
-    buf += instrText;
-    buf += RESET;
-    for (int i = instrVisualLen; i < g.termWidth; i++) buf += ' ';
-    buf += '\n';
+    {
+        const char* t = "Move: WASD/HJKL/Arrows | P: Pause | R: Restart | Q: Menu";
+        int pad = std::max(0, (g.termWidth - (int)strlen(t)) / 2);
+        for (int i = 0; i < pad; i++) buf += ' ';
+        buf += CYAN; buf += t; buf += RESET;
+    }
+    buf += ERASE_LINE "\n";
+    buf += ERASE_BELOW;
 
-    // ═══ PAUSE OVERLAY ══════════════════════════════════════
     if (g.paused) {
-        const char* pauseMsg = "  PAUSED -- Press P to resume  ";
-        int msgLen = (int)strlen(pauseMsg);
-        int centerRow = 2 + g.boardHeight / 2;
-        int contentVisualWidth = g.boardWidth * 2;
-        int centerCol = 2 + 2 + (contentVisualWidth - msgLen) / 2;
-        if (centerCol < 1) centerCol = 1;
-        char posCmd[32];
-        snprintf(posCmd, sizeof(posCmd), "\033[%d;%dH", centerRow, centerCol);
-        buf += posCmd;
+        const char* pm = "  PAUSED -- Press P to resume  ";
+        int ml = (int)strlen(pm);
+        int cr = g.offsetY + 2 + g.boardHeight / 2;
+        int cc = g.offsetX + 3 + std::max(0, (g.boardWidth * 2 - ml) / 2);
+        if (cc < 1) cc = 1;
+        char pos[32];
+        snprintf(pos, sizeof(pos), "\033[%d;%dH", cr, cc);
+        buf += pos;
         buf += BOLD YELLOW REVERSE;
-        buf += pauseMsg;
+        buf += pm;
         buf += RESET;
     }
 
@@ -657,143 +568,316 @@ void render(GameState &g) {
 }
 
 // ─── Centering Helpers ──────────────────────────────────────
-static std::string centerText(const std::string &s, int termW) {
-    int p = (termW - (int)s.size()) / 2;
-    if (p < 0) p = 0;
+static std::string centerText(const std::string &s, int tw) {
+    int p = std::max(0, (tw - (int)s.size()) / 2);
+    return std::string(p, ' ') + s;
+}
+static std::string centerColorText(const std::string &s, int vl, int tw) {
+    int p = std::max(0, (tw - vl) / 2);
     return std::string(p, ' ') + s;
 }
 
-static std::string centerColorText(const std::string &s, int visualLen, int termW) {
-    int p = (termW - visualLen) / 2;
-    if (p < 0) p = 0;
-    return std::string(p, ' ') + s;
+static void flushInput() {
+    char d; fd_set fds; struct timeval tv;
+    while (true) {
+        FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds); tv = {0, 0};
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) break;
+        read(STDIN_FILENO, &d, 1);
+    }
 }
 
-// ─── End Screen ─────────────────────────────────────────────
-void showEndScreen(int score, bool won) {
+// ─── Start Menu ─────────────────────────────────────────────
+AppState showStartMenu() {
+    flushInput();
     clearScreen();
-    saveScore(score);
-    std::vector<ScoreEntry> scores = loadScores();
 
-    int tw, th;
-    getTerminalSize(tw, th);
+    int sel = 0;
+    const int NOPTS = 3;
+    std::string buf;
+    buf.reserve(4096);
+    unsigned long frame = 0;
 
-    std::string titleText = won ? "Y O U   W I N !" : "G A M E   O V E R";
-    std::string titleColored = won
-        ? (std::string(BOLD) + BRIGHT_GREEN + titleText + RESET)
-        : (std::string(BOLD) + RED          + titleText + RESET);
-    int titleVisualLen = (int)titleText.size();
+    while (true) {
+        if (g_interrupted) return STATE_EXIT;
+        long long fs = nowMicros();
 
-    std::string border = std::string(CYAN) + "=============================" + RESET;
-    int borderVisualLen = 29;
+        int tw, th; getTerminalSize(tw, th);
+        if (tw < MIN_TERM_W || th < MIN_TERM_H) return STATE_TOO_SMALL;
 
-    std::string scoreLine =
-        std::string(BOLD) + YELLOW + "Final Score: " + RESET
-        + BRIGHT_WHITE + std::to_string(score) + RESET;
-    std::string scoreVisual = "Final Score: " + std::to_string(score);
-    int scoreVisualLen = (int)scoreVisual.size();
+        {
+            char c = 0;
+            while (true) {
+                fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+                struct timeval tv = {0, 0};
+                if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) break;
+                if (read(STDIN_FILENO, &c, 1) != 1) break;
+
+                if (c == 'q' || c == 'Q') return STATE_EXIT;
+                if (c == '1') { soundMenuSelect(); return STATE_PLAYING; }
+                if (c == '2') { soundMenuSelect(); return STATE_LEADERBOARD; }
+
+                if (c == '\r' || c == '\n' || c == ' ') {
+                    soundMenuSelect();
+                    switch (sel) {
+                        case 0: return STATE_PLAYING;
+                        case 1: return STATE_LEADERBOARD;
+                        case 2: return STATE_EXIT;
+                    }
+                }
+
+                if (c == '\033') {
+                    char seq[2] = {0, 0};
+                    fd_set f2; struct timeval t2;
+                    FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
+                    if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
+                        read(STDIN_FILENO, &seq[0], 1);
+                    FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
+                    if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
+                        read(STDIN_FILENO, &seq[1], 1);
+                    if (seq[0] == '[') {
+                        int prev = sel;
+                        if (seq[1] == 'A') sel = (sel - 1 + NOPTS) % NOPTS;
+                        else if (seq[1] == 'B') sel = (sel + 1) % NOPTS;
+                        if (sel != prev) soundMenuMove();
+                    }
+                    continue;
+                }
+
+                {
+                    int prev = sel;
+                    switch (c) {
+                        case 'w': case 'W': case 'k': case 'K':
+                            sel = (sel - 1 + NOPTS) % NOPTS; break;
+                        case 's': case 'S': case 'j': case 'J':
+                            sel = (sel + 1) % NOPTS; break;
+                    }
+                    if (sel != prev) soundMenuMove();
+                }
+            }
+        }
+
+        frame++;
+        int breathPhase = (frame / 20) % 3;
+        const char* breathAttr;
+        switch (breathPhase) {
+            case 0: breathAttr = DIM;  break;
+            case 1: breathAttr = "";   break;
+            default: breathAttr = BOLD; break;
+        }
+
+        buf.clear();
+        buf += "\033[1;1H";
+
+        int menuH = 13;
+        int topPad = std::max(1, (th - menuH) / 2);
+        for (int i = 0; i < topPad; i++) buf += ERASE_LINE "\n";
+
+        std::string bline = "========================================";
+        int blVis = (int)bline.size();
+        std::string blCol = std::string(CYAN) + bline + RESET;
+        buf += centerColorText(blCol, blVis, tw) + ERASE_LINE "\n";
+
+        std::string titleText = "V   S   N   A   K   E";
+        int titleVis = (int)titleText.size();
+        std::string titleCol = std::string(breathAttr) + BRIGHT_GREEN + titleText + RESET;
+        buf += centerColorText(titleCol, titleVis, tw) + ERASE_LINE "\n";
+        buf += centerColorText(blCol, blVis, tw) + ERASE_LINE "\n";
+        buf += ERASE_LINE "\n";
+
+        int decoPhase = (frame / 8) % 3;
+        std::string snakeHead;
+        switch (decoPhase) {
+            case 0: snakeHead = std::string(BOLD) + BRIGHT_GREEN + "O>" + RESET; break;
+            case 1: snakeHead = std::string(BOLD) + BRIGHT_CYAN  + "O>" + RESET; break;
+            case 2: snakeHead = std::string(BOLD) + BRIGHT_WHITE + "O>" + RESET; break;
+        }
+        std::string deco = std::string(DIM) + GREEN + "~" + RESET
+                         + BRIGHT_GREEN + "o" + RESET
+                         + GREEN + "o" + RESET
+                         + BRIGHT_GREEN + "o" + RESET
+                         + GREEN + "o" + RESET
+                         + snakeHead;
+        buf += centerColorText(deco, 9, tw) + ERASE_LINE "\n";
+        buf += ERASE_LINE "\n";
+
+        const char* labels[] = {"Start Game", "Leaderboard", "Quit"};
+        const char* keys[]   = {"1", "2", "Q"};
+
+        for (int i = 0; i < NOPTS; i++) {
+            char plain[48];
+            snprintf(plain, sizeof(plain), " %c  [%s]  %-14s",
+                     (i == sel) ? '>' : ' ', keys[i], labels[i]);
+            int plen = (int)strlen(plain);
+
+            if (i == sel) {
+                std::string col = std::string(BOLD) + YELLOW + REVERSE + plain + RESET;
+                buf += centerColorText(col, plen, tw);
+            } else {
+                std::string col = std::string(CYAN) + "[" + keys[i] + "]" + RESET
+                                + "  " + labels[i];
+                int vlen = 1 + (int)strlen(keys[i]) + 1 + 2 + (int)strlen(labels[i]);
+                buf += centerColorText(col, vlen, tw);
+            }
+            buf += ERASE_LINE "\n";
+        }
+
+        buf += ERASE_LINE "\n";
+        std::string footer = "Navigate: Arrows/WS  Select: Enter/Space";
+        buf += centerColorText(std::string(DIM) + footer + RESET,
+                               (int)footer.size(), tw);
+        buf += ERASE_LINE "\n";
+        buf += ERASE_BELOW;
+
+        write(STDOUT_FILENO, buf.c_str(), buf.size());
+
+        long long el = nowMicros() - fs;
+        long long sl = RENDER_TICK_US - el;
+        if (sl > 0) usleep(static_cast<useconds_t>(sl));
+    }
+}
+
+// ─── Leaderboard Screen ────────────────────────────────────
+AppState showLeaderboardScreen() {
+    clearScreen();
+    auto scores = loadScores();
+    int tw, th; getTerminalSize(tw, th);
+
+    std::string border = std::string(CYAN) + "=====================================" + RESET;
+    std::string title  = std::string(BOLD) + YELLOW + "L E A D E R B O A R D" + RESET;
+    std::string div    = std::string(CYAN) + "-------------------------------------" + RESET;
 
     std::string buf;
     buf += "\n\n";
-    buf += centerColorText(border, borderVisualLen, tw) + "\n";
-    buf += centerColorText(titleColored, titleVisualLen, tw) + "\n";
-    buf += centerColorText(border, borderVisualLen, tw) + "\n\n";
-    buf += centerColorText(scoreLine, scoreVisualLen, tw) + "\n\n";
+    buf += centerColorText(border, 37, tw) + "\n";
+    buf += centerColorText(title, 21, tw) + "\n";
+    buf += centerColorText(border, 37, tw) + "\n\n";
 
-    std::string topLabel = std::string(BOLD) + CYAN + "Top Scores:" + RESET;
-    buf += centerColorText(topLabel, 11, tw) + "\n";
+    int n = std::min((int)scores.size(), 10);
+    if (n == 0) {
+        buf += centerText("(no saved scores)", tw) + "\n";
+    } else {
+        for (int i = 0; i < n; i++) {
+            std::string rank = std::to_string(i + 1);
+            if (i < 9) rank = " " + rank;
+            std::string plain = rank + ". " + scores[i].timestamp
+                              + "  |  " + std::to_string(scores[i].score);
+            std::string col = std::string(CYAN) + rank + "." + RESET + " "
+                            + scores[i].timestamp + "  "
+                            + CYAN + "|" + RESET + "  "
+                            + YELLOW + std::to_string(scores[i].score) + RESET;
+            buf += centerColorText(col, (int)plain.size(), tw) + "\n";
+        }
+    }
 
-    std::string divider = std::string(CYAN) + "-----------------------------" + RESET;
-    buf += centerColorText(divider, 29, tw) + "\n";
+    buf += "\n";
+    buf += centerColorText(div, 37, tw) + "\n\n";
+    buf += centerColorText(std::string(BOLD) + GREEN + "Press [R] to Return to Menu" + RESET, 27, tw) + "\n";
+    buf += centerColorText(std::string(BOLD) + RED + "Press [Q] to Quit" + RESET, 17, tw) + "\n";
+    write(STDOUT_FILENO, buf.c_str(), buf.size());
+
+    flushInput();
+    while (true) {
+        if (g_interrupted) return STATE_EXIT;
+        fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+        struct timeval tv = {0, 50000};
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                if (c == 'r' || c == 'R') return STATE_MENU;
+                if (c == 'q' || c == 'Q') return STATE_EXIT;
+            }
+        }
+    }
+}
+
+// ─── Post-Game Screens ──────────────────────────────────────
+static AppState waitForMenuOrExit() {
+    flushInput();
+    while (true) {
+        if (g_interrupted) return STATE_EXIT;
+        fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+        struct timeval tv = {0, 50000};
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                if (c == 'r' || c == 'R') return STATE_MENU;
+                if (c == 'q' || c == 'Q') return STATE_EXIT;
+            }
+        }
+    }
+}
+
+void showEndScreen(int score, bool won) {
+    clearScreen();
+    saveScore(score);
+    auto scores = loadScores();
+    int tw, th; getTerminalSize(tw, th);
+
+    std::string titleText = won ? "Y O U   W I N !" : "G A M E   O V E R";
+    std::string titleCol = won
+        ? (std::string(BOLD) + BRIGHT_GREEN + titleText + RESET)
+        : (std::string(BOLD) + RED + titleText + RESET);
+    std::string border = std::string(CYAN) + "=============================" + RESET;
+    std::string scoreLine = std::string(BOLD) + YELLOW + "Final Score: " + RESET
+                          + BRIGHT_WHITE + std::to_string(score) + RESET;
+    std::string scoreVis = "Final Score: " + std::to_string(score);
+    std::string div = std::string(CYAN) + "-----------------------------" + RESET;
+
+    std::string buf;
+    buf += "\n\n";
+    buf += centerColorText(border, 29, tw) + "\n";
+    buf += centerColorText(titleCol, (int)titleText.size(), tw) + "\n";
+    buf += centerColorText(border, 29, tw) + "\n\n";
+    buf += centerColorText(scoreLine, (int)scoreVis.size(), tw) + "\n\n";
+    buf += centerColorText(std::string(BOLD) + CYAN + "Top Scores:" + RESET, 11, tw) + "\n";
+    buf += centerColorText(div, 29, tw) + "\n";
 
     int n = std::min((int)scores.size(), 10);
     for (int i = 0; i < n; i++) {
         std::string rank = std::to_string(i + 1);
         if (i < 9) rank = " " + rank;
-        std::string plainLine = rank + ". " + scores[i].timestamp
-                              + "  |  " + std::to_string(scores[i].score);
-        std::string colorLine =
-            std::string(CYAN) + rank + "." + RESET + " "
-            + scores[i].timestamp + "  "
-            + CYAN + "|" + RESET + "  "
-            + YELLOW + std::to_string(scores[i].score) + RESET;
-        buf += centerColorText(colorLine, (int)plainLine.size(), tw) + "\n";
+        std::string plain = rank + ". " + scores[i].timestamp
+                          + "  |  " + std::to_string(scores[i].score);
+        std::string col = std::string(CYAN) + rank + "." + RESET + " "
+                        + scores[i].timestamp + "  "
+                        + CYAN + "|" + RESET + "  "
+                        + YELLOW + std::to_string(scores[i].score) + RESET;
+        buf += centerColorText(col, (int)plain.size(), tw) + "\n";
     }
-    if (scores.empty())
-        buf += centerText("(no scores yet)", tw) + "\n";
+    if (scores.empty()) buf += centerText("(no scores yet)", tw) + "\n";
 
-    buf += centerColorText(divider, 29, tw) + "\n\n";
-
-    std::string restartLine = std::string(BOLD) + GREEN + "Press [R] to Restart" + RESET;
-    buf += centerColorText(restartLine, 20, tw) + "\n";
-    std::string quitLine = std::string(BOLD) + RED + "Press [Q] to Quit" + RESET;
-    buf += centerColorText(quitLine, 17, tw) + "\n";
-
+    buf += centerColorText(div, 29, tw) + "\n\n";
+    buf += centerColorText(std::string(BOLD) + GREEN + "Press [R] to Return to Menu" + RESET, 27, tw) + "\n";
+    buf += centerColorText(std::string(BOLD) + RED + "Press [Q] to Quit" + RESET, 17, tw) + "\n";
     write(STDOUT_FILENO, buf.c_str(), buf.size());
 }
 
-// ─── Resized Screen ─────────────────────────────────────────
 void showResizedScreen() {
     clearScreen();
-    int tw, th;
-    getTerminalSize(tw, th);
-
+    int tw, th; getTerminalSize(tw, th);
     std::string b = std::string(YELLOW) + "==============================" + RESET;
     std::string m = std::string(BOLD) + YELLOW + " Terminal resized during game  " + RESET;
-    std::string r = std::string(GREEN) + "Press [R] to Restart" + RESET;
-    std::string q = std::string(RED)   + "Press [Q] to Quit"   + RESET;
-
     std::string buf;
     buf += "\n\n";
     buf += centerColorText(b, 30, tw) + "\n";
     buf += centerColorText(m, 30, tw) + "\n";
     buf += centerColorText(b, 30, tw) + "\n\n";
-    buf += centerColorText(r, 20, tw) + "\n";
-    buf += centerColorText(q, 17, tw) + "\n";
-
+    buf += centerColorText(std::string(GREEN) + "Press [R] to Return to Menu" + RESET, 27, tw) + "\n";
+    buf += centerColorText(std::string(RED) + "Press [Q] to Quit" + RESET, 17, tw) + "\n";
     write(STDOUT_FILENO, buf.c_str(), buf.size());
 }
 
-// ─── Terminal Too Small Screen ──────────────────────────────
 void showTooSmallScreen() {
     clearScreen();
+    char sm[64]; snprintf(sm, sizeof(sm), "  Minimum size: %d x %d\n\n", MIN_TERM_W, MIN_TERM_H);
     std::string buf;
     buf += "\n";
     buf += std::string(BOLD) + RED + "  Terminal too small!\n" + RESET;
-    buf += std::string(YELLOW) + "  Minimum size: 30 x 16\n\n" + RESET;
+    buf += std::string(YELLOW) + sm + RESET;
     buf += "  Please resize your terminal,\n";
     buf += std::string("  then press ") + GREEN + "[R]" + RESET
-         + " to retry or " + RED + "[Q]" + RESET + " to quit.\n";
+         + " for menu or " + RED + "[Q]" + RESET + " to quit.\n";
     write(STDOUT_FILENO, buf.c_str(), buf.size());
-}
-
-// ─── Post-Game Input ────────────────────────────────────────
-bool waitForRestart() {
-    {
-        char discard;
-        fd_set fds; struct timeval tv;
-        while (true) {
-            FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
-            tv = {0, 0};
-            if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) break;
-            read(STDIN_FILENO, &discard, 1);
-        }
-    }
-    while (true) {
-        if (g_interrupted) return false;
-
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
-        struct timeval tv = {0, 50000};
-        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0) {
-            char c;
-            if (read(STDIN_FILENO, &c, 1) == 1) {
-                if (c == 'r' || c == 'R') return true;
-                if (c == 'q' || c == 'Q') return false;
-            }
-        }
-    }
 }
 
 // ─── Main ───────────────────────────────────────────────────
@@ -804,72 +888,106 @@ int main() {
     sa.sa_handler = signalHandler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
     enableRawMode();
     hideCursor();
-    write(STDOUT_FILENO, "\033[?1049h", 8); // enter alternate screen
+    write(STDOUT_FILENO, "\033[?1049h", 8);
     atexit(atexitCleanup);
 
-    bool playing = true;
+    AppState state = STATE_MENU;
+    int lastScore = 0;
+    bool lastWon = false;
 
-    while (playing) {
+    while (state != STATE_EXIT) {
         if (g_interrupted) break;
 
-        GameState game;
-        initGame(game);
+        switch (state) {
 
-        if (game.termTooSmall) {
-            showTooSmallScreen();
-            playing = waitForRestart();
-            continue;
-        }
+        case STATE_MENU:
+            state = showStartMenu();
+            break;
 
-        clearScreen();
+        case STATE_LEADERBOARD:
+            state = showLeaderboardScreen();
+            break;
 
-        while (game.running) {
-            long long frameStart = nowMicros();
+        case STATE_PLAYING: {
+            GameState game;
+            initGame(game);
 
-            if (g_interrupted) {
-                game.running = false;
-                playing = false;
-                break;
+            if (game.termTooSmall) { state = STATE_TOO_SMALL; break; }
+
+            clearScreen();
+            long long lastFrame = nowMicros();
+
+            while (game.running) {
+                long long fs = nowMicros();
+                long long dt = fs - lastFrame;
+                lastFrame = fs;
+
+                if (g_interrupted) { game.running = false; state = STATE_EXIT; break; }
+                if (checkTerminalResize(game)) break;
+
+                readInput(game);
+                if (!game.running) break;
+
+                if (!game.paused) {
+                    game.moveAccumulator += dt;
+                    long long mi = calcMoveInterval(game.score, game.nextDir);
+                    if (game.moveAccumulator > mi * 3) game.moveAccumulator = mi;
+                    while (game.moveAccumulator >= mi) {
+                        updateGame(game);
+                        if (!game.running) break;
+                        game.moveAccumulator -= mi;
+                        game.dirChangedThisTick = false;
+                        if (game.hasQueuedDir) {
+                            if (!isOpposite(game.queuedDir, game.dir) &&
+                                game.queuedDir != game.dir) {
+                                game.nextDir = game.queuedDir;
+                                game.dirChangedThisTick = true;
+                            }
+                            game.hasQueuedDir = false;
+                        }
+                        mi = calcMoveInterval(game.score, game.nextDir);
+                    }
+                }
+                if (!game.running) break;
+
+                render(game);
+
+                long long el = nowMicros() - fs;
+                long long sl = RENDER_TICK_US - el;
+                if (sl > 0) usleep(static_cast<useconds_t>(sl));
             }
 
-            if (checkTerminalResize(game)) break;
-
-            game.dirChangedThisTick = false;
-
-            readInput(game);
-            if (!game.running) break;
-
-            updateGame(game);
-            if (!game.running) break;
-
-            render(game);
-
-            long long elapsed   = nowMicros() - frameStart;
-            long long sleepTime = TICK_US - elapsed;
-            if (sleepTime > 0) {
-                usleep(static_cast<useconds_t>(sleepTime));
-            }
+            if (state == STATE_EXIT) break;
+            if (game.restartRequested) { state = STATE_PLAYING; }
+            else if (game.termResized) { state = STATE_RESIZED; }
+            else if (game.gameOver || game.gameWon) {
+                lastScore = game.score; lastWon = game.gameWon;
+                state = STATE_GAMEOVER;
+            } else { state = STATE_MENU; }
+            break;
         }
 
-        if (g_interrupted) break;
+        case STATE_GAMEOVER:
+            showEndScreen(lastScore, lastWon);
+            state = waitForMenuOrExit();
+            break;
 
-        if (game.restartRequested) {
-            continue;
-        }
-
-        if (game.termResized) {
+        case STATE_RESIZED:
             showResizedScreen();
-            playing = waitForRestart();
-        } else if (game.gameOver || game.gameWon) {
-            showEndScreen(game.score, game.gameWon);
-            playing = waitForRestart();
-        } else {
-            playing = false;
+            state = waitForMenuOrExit();
+            break;
+
+        case STATE_TOO_SMALL:
+            showTooSmallScreen();
+            state = waitForMenuOrExit();
+            break;
+
+        case STATE_EXIT: break;
         }
     }
 
