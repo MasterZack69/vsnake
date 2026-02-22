@@ -6,7 +6,9 @@ I wanted to do something. I needed to do something. I had heard praises about mu
 It is a vibe-coded recreation of the famous snake game (if that's what it is called, 'snake game'). This project was solely made to kill my boredom and test out multi-agent workflow.
 
 # Demo
-<video src="./demo.mp4" controls="controls" style="max-width: 100%"></video>
+
+<video src="https://github.com/user-attachments/assets/2539b45c-1523-4849-815f-a8067f5245f9
+" controls="controls" style="max-width: 100%"></video>
 
 # Credits
 - Me - I really did some work on this. Trust me.
