@@ -1,9 +1,3 @@
-// ============================================================
-//  VSNAKE — Retro Terminal Snake Game (C++, No ncurses)
-//  Iteration 18: PC speaker ioctl sound + BEL fallback
-//  Compile: g++ -std=c++11 snake.cpp -o snake
-// ============================================================
-
 #include <time.h>
 #include <signal.h>
 #include <sys/stat.h>
