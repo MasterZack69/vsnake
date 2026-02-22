@@ -11,4 +11,4 @@ It is a vibe-coded recreation of the famous snake game (if that's what it is cal
 - GPT 5.2 - Code Review & Analysis
 
 # Final Comment
-It exceeded my expectations.
+It exceeded my expectations. Linux only btw.
