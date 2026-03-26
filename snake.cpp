@@ -5,6 +5,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kd.h>
+#include <cmath>
+#include <sys/wait.h>
+#include <stdint.h>
 
 #include <iostream>
 #include <deque>
@@ -164,13 +167,164 @@ void performCleanup() {
 }
 void atexitCleanup() { performCleanup(); }
 
-// ===== SOUND DISABLED ======================================
+// ===== SOUND SYSTEM ========================================
+//
+// Generates WAV audio in-memory and pipes it to aplay/paplay
+// in a detached child process. Works on ALL terminal emulators
+// (bypasses the terminal entirely — no BEL dependency).
+//
+// Requires one of: aplay (alsa-utils) | paplay (pulseaudio)
+// Fails silently if neither is installed.
+//
 
-inline void soundEat() {}
-inline void soundGameOver() {}     //Zack here, fucked up the sound.
-inline void soundMenuMove() {}     //So now removing it with laziness     
-inline void soundMenuSelect() {}   // added dummy functions so code wont break
-inline void soundPauseToggle() {}  //sorry :(
+static const int SND_RATE = 44100;
+
+// --- Pre-generated WAV buffers (filled once by initSound) ---
+static std::vector<uint8_t> g_wavEat;
+static std::vector<uint8_t> g_wavGameOver;
+static std::vector<uint8_t> g_wavMenuMove;
+static std::vector<uint8_t> g_wavMenuSelect;
+static std::vector<uint8_t> g_wavPause;
+
+// Append a sine-wave tone to a PCM sample buffer
+static void appendTone(std::vector<int16_t>& pcm, float freq,
+                       float duration, float vol = 0.25f,
+                       bool fadeOut = true) {
+    int n = (int)(SND_RATE * duration);
+    int attack = SND_RATE * 2 / 1000;              // 2 ms click-free ramp
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / SND_RATE;
+        float env = fadeOut ? (1.0f - (float)i / n) : 1.0f;
+        if (i < attack) env *= (float)i / attack;  // smooth attack
+        float s = sinf(2.0f * (float)M_PI * freq * t) * vol * env;
+        int32_t v = (int32_t)(s * 32767);
+        if (v >  32767) v =  32767;
+        if (v < -32767) v = -32767;
+        pcm.push_back((int16_t)v);
+    }
+}
+
+// Build a valid WAV file (RIFF) in memory from signed-16-bit mono PCM
+static std::vector<uint8_t> buildWAV(const std::vector<int16_t>& pcm) {
+    uint32_t dataSize = (uint32_t)(pcm.size() * sizeof(int16_t));
+    std::vector<uint8_t> wav(44 + dataSize);
+    uint8_t* p = wav.data();
+
+    auto w16 = [&](uint16_t v) { memcpy(p, &v, 2); p += 2; };
+    auto w32 = [&](uint32_t v) { memcpy(p, &v, 4); p += 4; };
+    auto tag = [&](const char* s){ memcpy(p, s, 4); p += 4; };
+
+    tag("RIFF"); w32(36 + dataSize); tag("WAVE");
+    tag("fmt "); w32(16);
+    w16(1);                             // PCM format
+    w16(1);                             // mono
+    w32((uint32_t)SND_RATE);            // sample rate
+    w32((uint32_t)(SND_RATE * 2));      // byte rate  (rate × channels × bytes/sample)
+    w16(2);                             // block align (channels × bytes/sample)
+    w16(16);                            // bits per sample
+    tag("data"); w32(dataSize);
+    memcpy(p, pcm.data(), dataSize);
+
+    return wav;
+}
+
+// Fire-and-forget: pipe WAV data to an audio player in a fully
+// detached grandchild process.  Uses double-fork so no zombies.
+static void playWAVAsync(const std::vector<uint8_t>& wav) {
+    if (wav.empty()) return;
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return; }
+
+    if (pid == 0) {
+        // ── intermediate child ──
+        pid_t pid2 = fork();
+        if (pid2 < 0) _exit(1);
+        if (pid2 > 0) _exit(0);        // exit immediately → parent's waitpid returns fast
+
+        // ── grandchild (orphaned, adopted by init) ──
+        setsid();                       // detach from terminal session
+        close(pfd[1]);                  // close write end
+        dup2(pfd[0], STDIN_FILENO);     // pipe read → stdin
+        close(pfd[0]);
+
+        // silence stdout/stderr so aplay doesn't pollute the terminal
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        // try players in order — execlp only returns on failure
+        execlp("aplay",  "aplay",  "-q", "-t", "wav", "-", (char*)NULL);
+        execlp("paplay", "paplay", "-",                     (char*)NULL);
+        _exit(1);   // no player found — exit silently
+    }
+
+    // ── parent ──
+    close(pfd[0]);
+
+    const uint8_t* data = wav.data();
+    size_t rem = wav.size();
+    while (rem > 0) {
+        ssize_t n = write(pfd[1], data, rem);
+        if (n <= 0) break;              // EPIPE or error — ignore
+        data += n;
+        rem  -= n;
+    }
+    close(pfd[1]);
+
+    waitpid(pid, nullptr, 0);           // reap intermediate child (instant)
+}
+
+// Pre-generate every sound effect once as a WAV buffer
+static void initSound() {
+    // Eat apple
+    {
+        std::vector<int16_t> pcm;
+        appendTone(pcm, 1047.0f, 0.035f, 0.20f, false);
+        appendTone(pcm, 1319.0f, 0.035f, 0.20f, false);
+        appendTone(pcm, 1568.0f, 0.06f,  0.20f);
+        g_wavEat = buildWAV(pcm);
+    }
+    // Game over — sad descending tones
+    {
+        std::vector<int16_t> pcm;
+        appendTone(pcm, 440.0f, 0.18f, 0.22f);
+        appendTone(pcm, 330.0f, 0.18f, 0.20f);
+        appendTone(pcm, 220.0f, 0.28f, 0.18f);
+        g_wavGameOver = buildWAV(pcm);
+    }
+    // Menu move — short tick
+    {
+        std::vector<int16_t> pcm;
+        appendTone(pcm, 660.0f, 0.035f, 0.15f);
+        g_wavMenuMove = buildWAV(pcm);
+    }
+    // Menu select 
+    {
+        std::vector<int16_t> pcm;
+        appendTone(pcm, 550.0f, 0.05f, 0.15f);
+        g_wavMenuSelect = buildWAV(pcm);
+    }
+    // Pause toggle — blip
+    {
+        std::vector<int16_t> pcm;
+        appendTone(pcm, 550.0f, 0.05f, 0.15f);
+        g_wavPause = buildWAV(pcm);
+    }
+}
+
+// ── Sound API (called from game code) ──
+inline void soundEat()         { playWAVAsync(g_wavEat); }
+inline void soundGameOver()    { playWAVAsync(g_wavGameOver); }
+inline void soundMenuMove()    { playWAVAsync(g_wavMenuMove); }
+inline void soundMenuSelect()  { playWAVAsync(g_wavMenuSelect); }
+inline void soundPauseToggle() { playWAVAsync(g_wavPause); }
 
 // ─── Timestamp ──────────────────────────────────────────────
 std::string getCurrentTimestamp() {
@@ -885,10 +1039,19 @@ int main() {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+        // Ignore SIGPIPE so broken audio pipes don't kill the game
+    struct sigaction spa;
+    spa.sa_handler = SIG_IGN;
+    sigemptyset(&spa.sa_mask);
+    spa.sa_flags = 0;
+    sigaction(SIGPIPE, &spa, nullptr);
+
+
     enableRawMode();
     hideCursor();
     write(STDOUT_FILENO, "\033[?1049h", 8);
     atexit(atexitCleanup);
+    initSound();
 
     AppState state = STATE_MENU;
     int lastScore = 0;
