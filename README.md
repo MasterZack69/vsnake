@@ -5,6 +5,9 @@ I wanted to do something. I needed to do something. I had heard praises about mu
 # What again?
 It is a vibe-coded recreation of the famous snake game (if that's what it is called, 'snake game'). This project was solely made to kill my boredom and test out multi-agent workflow.
 
+# Install this for sound
+- alsa-utils
+
 # Demo
 
 <video src="https://github.com/user-attachments/assets/2539b45c-1523-4849-815f-a8067f5245f9
