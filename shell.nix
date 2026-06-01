@@ -11,5 +11,6 @@ pkgs.mkShell {
 
   shellHook = ''
     echo "Done"
+    trap 'echo "Done"' EXIT
   '';
 }
