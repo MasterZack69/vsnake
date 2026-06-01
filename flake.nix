@@ -22,6 +22,9 @@
               clang-tools
               alsa-lib
             ];
+            shellHook = ''
+              echo "Shell Loaded"
+            '';
           };
         }
       );
