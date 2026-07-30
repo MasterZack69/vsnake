@@ -22,6 +22,7 @@
             src = ./.;
 
             nativeBuildInputs = with pkgs; [ makeWrapper ];
+            buildInputs = with pkgs; [ alsa-utils ];
 
             buildPhase = ''
               runHook preBuild
@@ -33,11 +34,12 @@
               runHook preInstall
               mkdir -p $out/bin
               cp vsnake $out/bin/
+              wrapProgram $out/bin/vsnake --prefix PATH : ${pkgs.alsa-utils}/bin
               runHook postInstall
             '';
 
             meta = {
-              description = "A terminal-based snake game with sound effects";
+              description = "Vibe-Coded recreation of the classic snake game in C++";
               homepage = "https://github.com/MasterZack69/vsnake";
               license = pkgs.lib.licenses.agpl3Only;
               mainProgram = "vsnake";
