@@ -24,6 +24,9 @@
 #include <termios.h>
 #include <sys/select.h>
 
+#define SILENT_WRITE(fd, buf, count) do { __attribute__((unused)) ssize_t _r_ = write((fd), (buf), (count)); } while(0)
+#define SILENT_READ(fd, buf, count)  do { __attribute__((unused)) ssize_t _r_ = read((fd), (buf), (count)); } while(0)
+
 // ─── ANSI Constants ─────────────────────────────────────────
 #define RESET        "\033[0m"
 #define BOLD         "\033[1m"
@@ -141,9 +144,9 @@ void enableRawMode() {
     rawModeEnabled = true;
 }
 
-void clearScreen()  { write(STDOUT_FILENO, "\033[2J\033[1;1H", 11); }
-void hideCursor()   { write(STDOUT_FILENO, "\033[?25l", 6); }
-void showCursor()   { write(STDOUT_FILENO, "\033[?25h", 6); }
+void clearScreen()  { SILENT_WRITE(STDOUT_FILENO, "\033[2J\033[1;1H", 11); }
+void hideCursor()   { SILENT_WRITE(STDOUT_FILENO, "\033[?25l", 6); }
+void showCursor()   { SILENT_WRITE(STDOUT_FILENO, "\033[?25h", 6); }
 
 void getTerminalSize(int &w, int &h) {
     struct winsize ws;
@@ -159,9 +162,9 @@ long long nowMicros() {
 }
 
 void performCleanup() {
-    write(STDOUT_FILENO, "\033[?1049l", 8);
-    write(STDOUT_FILENO, "\033[0m", 4);
-    write(STDOUT_FILENO, "\033[2J\033[H", 7);
+    SILENT_WRITE(STDOUT_FILENO, "\033[?1049l", 8);
+    SILENT_WRITE(STDOUT_FILENO, "\033[0m", 4);
+    SILENT_WRITE(STDOUT_FILENO, "\033[2J\033[H", 7);
     showCursor();
     disableRawMode();
 }
@@ -528,10 +531,10 @@ void readInput(GameState &g) {
             fd_set f2; struct timeval t2;
             FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
             if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
-                read(STDIN_FILENO, &seq[0], 1);
+                SILENT_READ(STDIN_FILENO, &seq[0], 1);
             FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
             if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
-                read(STDIN_FILENO, &seq[1], 1);
+                SILENT_READ(STDIN_FILENO, &seq[1], 1);
             if (seq[0] == '[') {
                 switch (seq[1]) {
                     case 'A': tryChangeDirection(g, UP);    break;
@@ -712,7 +715,7 @@ void render(GameState &g) {
         buf += RESET;
     }
 
-    write(STDOUT_FILENO, buf.c_str(), buf.size());
+    SILENT_WRITE(STDOUT_FILENO, buf.c_str(), buf.size());
 }
 
 // ─── Centering Helpers ──────────────────────────────────────
@@ -730,7 +733,7 @@ static void flushInput() {
     while (true) {
         FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds); tv = {0, 0};
         if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) break;
-        read(STDIN_FILENO, &d, 1);
+        SILENT_READ(STDIN_FILENO, &d, 1);
     }
 }
 
@@ -778,10 +781,10 @@ AppState showStartMenu() {
                     fd_set f2; struct timeval t2;
                     FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
                     if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
-                        read(STDIN_FILENO, &seq[0], 1);
+                        SILENT_READ(STDIN_FILENO, &seq[0], 1);
                     FD_ZERO(&f2); FD_SET(STDIN_FILENO, &f2); t2 = {0, 5000};
                     if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &t2) > 0)
-                        read(STDIN_FILENO, &seq[1], 1);
+                        SILENT_READ(STDIN_FILENO, &seq[1], 1);
                     if (seq[0] == '[') {
                         int prev = sel;
                         if (seq[1] == 'A') sel = (sel - 1 + NOPTS) % NOPTS;
@@ -876,7 +879,7 @@ AppState showStartMenu() {
         buf += ERASE_LINE "\n";
         buf += ERASE_BELOW;
 
-        write(STDOUT_FILENO, buf.c_str(), buf.size());
+        SILENT_WRITE(STDOUT_FILENO, buf.c_str(), buf.size());
 
         long long el = nowMicros() - fs;
         long long sl = RENDER_TICK_US - el;
@@ -921,7 +924,7 @@ AppState showLeaderboardScreen() {
     buf += centerColorText(div, 37, tw) + "\n\n";
     buf += centerColorText(std::string(BOLD) + GREEN + "Press [R] to Return to Menu" + RESET, 27, tw) + "\n";
     buf += centerColorText(std::string(BOLD) + RED + "Press [Q] to Quit" + RESET, 17, tw) + "\n";
-    write(STDOUT_FILENO, buf.c_str(), buf.size());
+    SILENT_WRITE(STDOUT_FILENO, buf.c_str(), buf.size());
 
     flushInput();
     while (true) {
@@ -997,7 +1000,7 @@ void showEndScreen(int score, bool won) {
     buf += centerColorText(div, 29, tw) + "\n\n";
     buf += centerColorText(std::string(BOLD) + GREEN + "Press [R] to Return to Menu" + RESET, 27, tw) + "\n";
     buf += centerColorText(std::string(BOLD) + RED + "Press [Q] to Quit" + RESET, 17, tw) + "\n";
-    write(STDOUT_FILENO, buf.c_str(), buf.size());
+    SILENT_WRITE(STDOUT_FILENO, buf.c_str(), buf.size());
 }
 
 void showResizedScreen() {
@@ -1012,7 +1015,7 @@ void showResizedScreen() {
     buf += centerColorText(b, 30, tw) + "\n\n";
     buf += centerColorText(std::string(GREEN) + "Press [R] to Return to Menu" + RESET, 27, tw) + "\n";
     buf += centerColorText(std::string(RED) + "Press [Q] to Quit" + RESET, 17, tw) + "\n";
-    write(STDOUT_FILENO, buf.c_str(), buf.size());
+    SILENT_WRITE(STDOUT_FILENO, buf.c_str(), buf.size());
 }
 
 void showTooSmallScreen() {
@@ -1025,7 +1028,7 @@ void showTooSmallScreen() {
     buf += "  Please resize your terminal,\n";
     buf += std::string("  then press ") + GREEN + "[R]" + RESET
          + " for menu or " + RED + "[Q]" + RESET + " to quit.\n";
-    write(STDOUT_FILENO, buf.c_str(), buf.size());
+    SILENT_WRITE(STDOUT_FILENO, buf.c_str(), buf.size());
 }
 
 // ─── Main ───────────────────────────────────────────────────
@@ -1049,7 +1052,7 @@ int main() {
 
     enableRawMode();
     hideCursor();
-    write(STDOUT_FILENO, "\033[?1049h", 8);
+    SILENT_WRITE(STDOUT_FILENO, "\033[?1049h", 8);
     atexit(atexitCleanup);
     initSound();
 
